@@ -1,0 +1,183 @@
+{
+  "__inputs": [
+    {"name": "DS_SOLAR", "label": "Solar InfluxDB", "description": "InfluxDB datasource using InfluxQL and the solar database", "type": "datasource", "pluginId": "influxdb", "pluginName": "InfluxDB"}
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "13.2.1"},
+    {"type": "datasource", "id": "influxdb", "name": "InfluxDB", "version": "1.0.0"},
+    {"type": "panel", "id": "stat", "name": "Stat", "version": ""},
+    {"type": "panel", "id": "timeseries", "name": "Time series", "version": ""},
+    {"type": "panel", "id": "table", "name": "Table", "version": ""},
+    {"type": "panel", "id": "text", "name": "Text", "version": ""}
+  ],
+  "id": null,
+  "uid": "delta-solar-inverters",
+  "title": "Delta Solar — Production & Inverter Diagnostics",
+  "description": "Delta M4-TL-US BLE collector: production, electrical measurements and data availability. InfluxDB 1.x / InfluxQL.",
+  "tags": ["solar", "delta", "influxdb"],
+  "timezone": "America/Los_Angeles",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "1m",
+  "time": {"from": "now-24h", "to": "now"},
+  "timepicker": {"refresh_intervals": ["1m", "5m", "15m", "30m", "1h"]},
+  "annotations": {"list": []},
+  "links": [],
+  "templating": {
+    "list": [
+      {
+        "name": "serial", "label": "Inverter", "type": "query",
+        "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"},
+        "query": "SHOW TAG VALUES FROM \"inverter_data\" WITH KEY = \"serial\" WHERE \"model\" = 'M4-TL-US'",
+        "definition": "SHOW TAG VALUES FROM \"inverter_data\" WITH KEY = \"serial\" WHERE \"model\" = 'M4-TL-US'",
+        "refresh": 1, "sort": 1, "multi": true, "includeAll": true, "allValue": ".*",
+        "current": {"selected": true, "text": ["All"], "value": ["$__all"]},
+        "options": [], "hide": 0, "skipUrlSync": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "text", "title": "Reading this dashboard",
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 3},
+      "options": {"mode": "markdown", "content": "**Delta M4-TL-US · Pacific time · ~60-second polling**\n\nRecent power uses the last **5 minutes of wall-clock time**, independent of the date picker. Other panels use the selected range. **Reported energy counter** is the inverter's `DailyEnergy` value; reset behavior is unverified, so it is not a verified daily yield. Gaps mean missing readings, not zero production. Unsupported PV channels remain empty."}
+    },
+    {
+      "id": 2, "type": "stat", "title": "Recent power · last 5 minutes",
+      "description": "Latest Power sample for each selected inverter within the last five minutes, independent of the dashboard time range. Missing series indicate no recent Power sample, not zero output.",
+      "gridPos": {"x": 0, "y": 3, "w": 12, "h": 4},
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"},
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT LAST(\"Power\") FROM \"inverter_data\" WHERE time > now() - 5m AND time <= now() AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY \"serial\""}],
+      "fieldConfig": {"defaults": {"unit": "kwatt", "decimals": 2, "min": 0, "noValue": "No recent sample", "color": {"mode": "palette-classic"}}, "overrides": [
+        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+      ]},
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "value_and_name", "colorMode": "value", "graphMode": "none", "justifyMode": "auto"}
+    },
+    {
+      "id": 3, "type": "stat", "title": "Reported energy counter · latest in range",
+      "description": "Raw DailyEnergy counter in kWh. Reset behavior has not been verified. This is not a calculated today total; the last value may be old when an inverter is offline.",
+      "gridPos": {"x": 12, "y": 3, "w": 12, "h": 4},
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"},
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT LAST(\"DailyEnergy\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY \"serial\""}],
+      "fieldConfig": {"defaults": {"unit": "kwatth", "decimals": 2, "min": 0, "noValue": "No sample", "color": {"mode": "palette-classic"}}, "overrides": [
+        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+      ]},
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "value_and_name", "colorMode": "value", "graphMode": "none", "justifyMode": "auto"}
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "AC production by inverter",
+      "description": "Mean power per display interval. Null intervals are not connected or replaced with zero.",
+      "gridPos": {"x": 0, "y": 7, "w": 12, "h": 8},
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT MEAN(\"Power\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
+      "fieldConfig": {"defaults": {"unit": "kwatt", "decimals": 2, "min": 0, "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": false, "showPoints": "never"}}, "overrides": [
+        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+      ]},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Combined production · stacked observed power",
+      "description": "Stacked mean power of selected inverters. A missing inverter makes the visible stack incomplete; this is not a guaranteed whole-site total. Samples are asynchronous and averaged into common time buckets.",
+      "gridPos": {"x": 12, "y": 7, "w": 12, "h": 8},
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT MEAN(\"Power\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
+      "fieldConfig": {"defaults": {"unit": "kwatt", "decimals": 2, "min": 0, "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 45, "spanNulls": false, "showPoints": "never", "stacking": {"mode": "normal", "group": "production"}}}, "overrides": [
+        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+      ]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Reported energy counter trend",
+      "description": "Last DailyEnergy value in each interval. Counter drops may help establish reset behavior. Do not sum counter samples to calculate generation.",
+      "gridPos": {"x": 0, "y": 15, "w": 24, "h": 7},
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT LAST(\"DailyEnergy\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
+      "fieldConfig": {"defaults": {"unit": "kwatth", "decimals": 2, "min": 0, "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 5, "spanNulls": false}}, "overrides": [
+        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+      ]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "AC voltage",
+      "gridPos": {"x": 0, "y": 22, "w": 8, "h": 7},
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT MEAN(\"ACVoltage\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
+      "fieldConfig": {"defaults": {"unit": "volt", "decimals": 1, "color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2, "spanNulls": false}}, "overrides": [
+        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+      ]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "AC current",
+      "gridPos": {"x": 8, "y": 22, "w": 8, "h": 7},
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT MEAN(\"ACCurrent\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
+      "fieldConfig": {"defaults": {"unit": "amp", "decimals": 2, "min": 0, "color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2, "spanNulls": false}}, "overrides": [
+        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+      ]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "AC frequency",
+      "gridPos": {"x": 16, "y": 22, "w": 8, "h": 7},
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT MEAN(\"ACFrequency\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
+      "fieldConfig": {"defaults": {"unit": "hertz", "decimals": 2, "color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2, "spanNulls": false}}, "overrides": [
+        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+      ]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "PV input voltage · $serial",
+      "description": "PV1–PV4 where supported. Empty channels mean the inverter did not report that field.",
+      "gridPos": {"x": 0, "y": 29, "w": 12, "h": 7}, "repeat": "serial", "repeatDirection": "h", "maxPerRow": 2,
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "$col", "query": "SELECT MEAN(\"PV1Voltage\") AS \"PV1\", MEAN(\"PV2Voltage\") AS \"PV2\", MEAN(\"PV3Voltage\") AS \"PV3\", MEAN(\"PV4Voltage\") AS \"PV4\" FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
+      "fieldConfig": {"defaults": {"unit": "volt", "decimals": 1, "min": 0, "color": {"mode": "palette-classic-by-name"}, "custom": {"lineWidth": 2, "spanNulls": false}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "PV input current · $serial",
+      "description": "PV1–PV4 where supported. Empty channels mean the inverter did not report that field.",
+      "gridPos": {"x": 0, "y": 36, "w": 12, "h": 7}, "repeat": "serial", "repeatDirection": "h", "maxPerRow": 2,
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "$col", "query": "SELECT MEAN(\"PV1Current\") AS \"PV1\", MEAN(\"PV2Current\") AS \"PV2\", MEAN(\"PV3Current\") AS \"PV3\", MEAN(\"PV4Current\") AS \"PV4\" FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
+      "fieldConfig": {"defaults": {"unit": "amp", "decimals": 2, "min": 0, "color": {"mode": "palette-classic-by-name"}, "custom": {"lineWidth": 2, "spanNulls": false}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "none"}}
+    },
+    {
+      "id": 12, "type": "table", "title": "Last Power measurement · selected range",
+      "description": "LAST(Power) without time grouping preserves the original sample timestamp. Select a wider range to locate older readings. A completed read can omit Power, so this is freshness of the Power field, not proof of collector health. The frame selector switches between inverter series if Grafana returns separate tables.",
+      "gridPos": {"x": 0, "y": 43, "w": 12, "h": 7},
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"},
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "table", "query": "SELECT LAST(\"Power\") AS \"Power (kW)\" FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY \"serial\""}],
+      "fieldConfig": {"defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}, "inspect": false}}, "overrides": [
+        {"matcher": {"id": "byName", "options": "Time"}, "properties": [{"id": "unit", "value": "dateTimeAsIso"}, {"id": "custom.width", "value": 260}]},
+        {"matcher": {"id": "byName", "options": "Power (kW)"}, "properties": [{"id": "unit", "value": "kwatt"}, {"id": "decimals", "value": 2}]}
+      ]},
+      "options": {"showHeader": true, "cellHeight": "sm", "sortBy": [{"displayName": "Time", "desc": true}]}
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Power samples received · per 5 minutes",
+      "description": "Count of stored Power samples, not polling success rate. Around five per complete bucket is typical with 60-second polling. Retries, missing Power fields and offline/nighttime devices reduce counts; spool replay can backfill old buckets. Edge buckets may be partial. Empty buckets are zero counts, not zero production.",
+      "gridPos": {"x": 12, "y": 43, "w": 12, "h": 7},
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "5m",
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT COUNT(\"Power\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time(5m), \"serial\" fill(0)"}],
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "min": 0, "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineInterpolation": "stepAfter", "lineWidth": 2, "fillOpacity": 10, "spanNulls": false}}, "overrides": [
+        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
+      ]},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "none"}}
+    }
+  ]
+}

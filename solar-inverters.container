@@ -1,0 +1,26 @@
+[Unit]
+Description=Delta M4 solar inverter collector (1010 and 1006)
+Wants=network-online.target bluetooth.service
+After=network-online.target bluetooth.service
+Requires=dbus.service
+StartLimitIntervalSec=0
+
+[Container]
+Image=localhost/delta-solar:latest
+Pull=never
+ContainerName=solar-inverters
+Network=host
+EnvironmentFile=/etc/solar-inverters.env
+Environment=DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
+# Mount the directory so a recreated system bus socket is visible too.
+Volume=/run/dbus:/run/dbus:ro
+Volume=solar-inverters-data:/var/lib/delta-solar
+LogDriver=journald
+
+[Service]
+Restart=always
+RestartSec=15
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
