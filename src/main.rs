@@ -24,6 +24,15 @@ use uuid::Uuid;
 const WRITE: Uuid = Uuid::from_u128(0xee6d717188c611e8b444060400ef5315);
 const NOTIFY: Uuid = Uuid::from_u128(0xee6d717288c611e8b444060400ef5315);
 
+// Per-read quality metrics, logged alongside every polling cycle so partial
+// reads are visible even when they still produce usable data.
+#[derive(Default)]
+struct ReadQuality {
+    commands_requested: u32,
+    commands_timed_out: u32,
+    samples_by_field: BTreeMap<String, u32>,
+}
+
 struct Inverter {
     serial: String,
     mac: String,
@@ -45,11 +54,10 @@ fn setting(key: &str, default: &str) -> String {
 
 impl Config {
     fn load() -> Result<Self> {
-        let inverters_str = env::var("INVERTERS")
-            .context("INVERTERS env var is required (serial=MAC pairs)")?;
+        let inverters_str =
+            env::var("INVERTERS").context("INVERTERS env var is required (serial=MAC pairs)")?;
         let mut inverters = Vec::new();
-        for entry in inverters_str.split(',')
-        {
+        for entry in inverters_str.split(',') {
             let (serial, mac) = entry
                 .split_once('=')
                 .context("INVERTERS must contain serial=MAC pairs")?;
@@ -86,7 +94,7 @@ impl Config {
             interval: Duration::from_secs(interval),
             poll_timeout: Duration::from_secs(poll_timeout),
             adapter: setting("BLUETOOTH_ADAPTER_INDEX", "0").parse()?,
-            concurrent: match setting("POLL_MODE", "concurrent").as_str() {
+            concurrent: match setting("POLL_MODE", "sequential").as_str() {
                 "concurrent" => true,
                 "sequential" => false,
                 _ => bail!("POLL_MODE must be concurrent or sequential"),
@@ -95,7 +103,7 @@ impl Config {
     }
 }
 
-async fn collect(device: &Peripheral) -> Result<BTreeMap<String, f64>> {
+async fn collect(device: &Peripheral) -> Result<(BTreeMap<String, f64>, ReadQuality)> {
     debug!(stage = "services", "Discovering GATT services");
     device
         .discover_services()
@@ -118,16 +126,19 @@ async fn collect(device: &Peripheral) -> Result<BTreeMap<String, f64>> {
     debug!(stage = "read", "Reading measurements");
     let mut decoder = protocol::Decoder::default();
     let mut samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut quality = ReadQuality::default();
     // Upstream's access command, without replaying its captured clock-setting writes.
     let mut commands = vec![vec![0, 9], vec![120, 5], vec![100, 253, 25, 132]];
     for _ in 0..2 {
         commands.extend(protocol::FIELDS.iter().map(|(_, a, b, _)| vec![*a, *b]));
     }
     for payload in commands {
+        quality.commands_requested += 1;
         device
             .write(write, &protocol::command(&payload), WriteType::WithResponse)
             .await?;
         let deadline = Instant::now() + Duration::from_secs(2);
+        let mut matched = false;
         loop {
             let notification = match timeout(
                 deadline.saturating_duration_since(Instant::now()),
@@ -138,6 +149,7 @@ async fn collect(device: &Peripheral) -> Result<BTreeMap<String, f64>> {
                 Ok(Some(n)) => n,
                 Ok(None) => bail!("Bluetooth notification stream ended"),
                 Err(_) => {
+                    quality.commands_timed_out += 1;
                     warn!(command = ?payload, "No response to command");
                     break;
                 }
@@ -145,7 +157,6 @@ async fn collect(device: &Peripheral) -> Result<BTreeMap<String, f64>> {
             if notification.uuid != NOTIFY {
                 continue;
             }
-            let mut matched = false;
             for frame in decoder.push(&notification.value) {
                 if frame[4..6] != payload[..2] {
                     continue;
@@ -159,6 +170,7 @@ async fn collect(device: &Peripheral) -> Result<BTreeMap<String, f64>> {
                         .iter()
                         .find(|(_, a, b, _)| *a == frame[4] && *b == frame[5])
                     {
+                        *quality.samples_by_field.entry((*name).into()).or_insert(0) += 1;
                         samples
                             .entry((*name).into())
                             .or_default()
@@ -187,10 +199,11 @@ async fn collect(device: &Peripheral) -> Result<BTreeMap<String, f64>> {
     if samples.is_empty() {
         bail!("No usable measurements received");
     }
-    Ok(samples
+    let fields = samples
         .into_iter()
         .map(|(name, values)| (name, values.iter().sum::<f64>() / values.len() as f64))
-        .collect())
+        .collect();
+    Ok((fields, quality))
 }
 
 fn line(serial: &str, fields: &BTreeMap<String, f64>, timestamp: i64) -> String {
@@ -305,7 +318,7 @@ impl Radio {
         &self,
         inverter: &Inverter,
         deadline: Instant,
-    ) -> Result<(i64, BTreeMap<String, f64>)> {
+    ) -> Result<(i64, BTreeMap<String, f64>, ReadQuality)> {
         let device = self.connect(inverter, deadline).await?;
         let timestamp = chrono::Utc::now()
             .timestamp_nanos_opt()
@@ -318,12 +331,13 @@ impl Radio {
         let mut ready_at = self.ready_at.lock().await;
         disconnect(&device).await;
         *ready_at = Instant::now() + Duration::from_secs(2);
-        Ok((timestamp, result??))
+        let (fields, quality) = result??;
+        Ok((timestamp, fields, quality))
     }
 }
 
 async fn disconnect(device: &Peripheral) {
-    debug!(stage = "disconnect", "Disconnecting Bluetooth");
+    info!(stage = "disconnect", "Disconnecting Bluetooth");
     match timeout(Duration::from_secs(5), device.disconnect()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!(%error, "Bluetooth disconnect failed"),
@@ -391,17 +405,29 @@ async fn poll_inverter(
         .await;
         cycles += 1;
         match result {
-            Ok((timestamp, fields)) => {
+            Ok((timestamp, fields, quality)) => {
                 enqueue(&config.spool, &line(&inverter.serial, &fields, timestamp)).await?;
                 uploads.notify_one();
                 last_success = Some(Instant::now());
                 successes += 1;
+                let complete = quality.commands_timed_out == 0;
+                let samples: Vec<String> = quality
+                    .samples_by_field
+                    .iter()
+                    .map(|(name, count)| format!("{name}:{count}"))
+                    .collect();
                 let formatted_fields = fields
                     .iter()
                     .map(|(name, value)| format!("{name}={value:.3}"))
                     .collect::<Vec<_>>()
                     .join(" ");
-                info!(fields = %formatted_fields, "Queued measurements");
+                info!(
+                    fields = %formatted_fields,
+                    samples = %samples.join(","),
+                    commands_timed_out = quality.commands_timed_out,
+                    complete = complete,
+                    "Queued measurements",
+                );
             }
             Err(error) => warn!(error = %format!("{error:#}"), "Polling cycle failed"),
         }

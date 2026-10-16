@@ -78,13 +78,14 @@ stored timestamps remain UTC. Set dashboards to America/Los_Angeles for
 Pacific-time display and use timezone-aware day boundaries for daily totals.
 
 Each inverter has an independent Tokio polling task with a default **60-second
-minimum interval**. `POLL_MODE=concurrent` (the default, even with an older env
-file) allows overlapping reads. A shared radio coordinator serializes discovery,
-connection attempts, and disconnects. Each connection attempt refreshes discovery
-for five seconds, then has up to 15 seconds to connect. Once connected, the
-coordinator is released during service discovery and measurement collection so
-the other inverter can connect. A two-second cooldown follows disconnects,
-including cleanup after failed connections.
+minimum interval**. `POLL_MODE=sequential` (the default) polls one inverter at a
+time. `POLL_MODE=concurrent` allows overlapping reads while a shared radio
+coordinator serializes discovery, connection attempts, and disconnects. Each
+connection attempt refreshes discovery for five seconds, then has up to 15
+seconds to connect. Once connected, the coordinator is released during service
+discovery and measurement collection so the other inverter can connect. A
+two-second cooldown follows disconnects, including cleanup after failed
+connections.
 
 Each polling cycle allows up to **three attempts**, with randomized backoff of
 2–5 seconds before the second attempt and 4–7 seconds before the third. A shared
@@ -96,16 +97,23 @@ retried; partial failed reads are discarded rather than merged across attempts.
 The next cycle starts after the configured interval, or at least one second after
 an overlong cycle finishes. Cycles for the **same** inverter never overlap.
 
-Set `POLL_MODE=sequential` to compare reliability with only one inverter's full
-read/retry cycle active at a time. Either mode uses the same radio coordination
-and retry policy. Initialization and spool-write failures exit for systemd to
-restart; discovery/connection/read failures are logged and retried. Concurrent
-reads cannot overcome another client holding an inverter's only BLE connection.
+`POLL_MODE=sequential` avoids overlapping Bluetooth sessions and is recommended
+for this Pi and inverter combination. Concurrent reads cannot overcome another
+client holding an inverter's only BLE connection, but they add variable connection
+contention.
 
 Logs include the inverter serial, attempt number, complete error chain, and a
 per-inverter status summary (`cycles`, `successes`, `seconds_since_success`).
 `seconds_since_success=None` means no reading has succeeded since this process
 started. Counts describe whole polling cycles, not individual connection attempts.
+
+Each queued-measurement log includes:
+- **`complete=true`**: every requested command received a response.
+- **`complete=false`**: at least one command timed out; remaining samples still
+  upload if any measurements were received.
+- **`samples=name:count,...`**: valid samples received per field. Two samples per
+  field are requested; fewer means partial coverage from transient command loss.
+- **`commands_timed_out=N`**: number of commands that received no response.
 Debug logging adds discovery, connection, read, and disconnect stages. Field
 values in logs are rounded to three decimal places; stored precision is unchanged.
 
@@ -195,8 +203,9 @@ The decoder validates CRCs, reassembles fragmented frames, and matches replies
 to command IDs. Captured clock-setting commands are deliberately omitted to
 avoid replaying upstream's fixed 2021 date/time. The captured access exchange
 is retained. Both inverters have returned readings and uploaded successfully on
-the Pi; the new concurrent connection/retry behavior still needs comparison on
-that hardware.
+the Pi; sequential mode is the operational default based on hardware testing.
+Concurrent mode remains available but is not recommended while overlapping
+Bluetooth sessions produce intermittent connection issues.
 
 ```sh
 cargo test --locked
