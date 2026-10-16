@@ -33,6 +33,22 @@ struct ReadQuality {
     samples_by_field: BTreeMap<String, u32>,
 }
 
+// Per-phase timing for a single read cycle, used to tune command sleeps and
+// response timeouts.
+#[derive(Default)]
+struct Timing {
+    scan_ms: u64,
+    connect_attempt_ms: u64,
+    service_discovery_ms: u64,
+    subscription_ms: u64,
+    command_ms: u64,
+    sleep_ms: u64,
+    response_wait_ms: u64,
+    disconnect_ms: u64,
+    total_ms: u64,
+    slow_commands: Vec<(u16, u16, u64)>,
+}
+
 struct Inverter {
     serial: String,
     mac: String,
@@ -103,12 +119,18 @@ impl Config {
     }
 }
 
-async fn collect(device: &Peripheral) -> Result<(BTreeMap<String, f64>, ReadQuality)> {
+async fn collect(
+    device: &Peripheral,
+    timing: &mut Timing,
+) -> Result<(BTreeMap<String, f64>, ReadQuality)> {
     debug!(stage = "services", "Discovering GATT services");
+    let discovery_start = Instant::now();
     device
         .discover_services()
         .await
         .context("Discover GATT services")?;
+    timing.service_discovery_ms = discovery_start.elapsed().as_millis() as u64;
+
     let chars = device.characteristics();
     let write = chars
         .iter()
@@ -118,11 +140,14 @@ async fn collect(device: &Peripheral) -> Result<(BTreeMap<String, f64>, ReadQual
         .iter()
         .find(|c| c.uuid == NOTIFY)
         .context("Delta notify characteristic missing")?;
+    let sub_start = Instant::now();
     let mut notifications = device.notifications().await?;
     device
         .subscribe(notify)
         .await
         .context("Subscribe to measurements")?;
+    timing.subscription_ms = sub_start.elapsed().as_millis() as u64;
+
     debug!(stage = "read", "Reading measurements");
     let mut decoder = protocol::Decoder::default();
     let mut samples: BTreeMap<String, Vec<f64>> = BTreeMap::new();
@@ -132,11 +157,16 @@ async fn collect(device: &Peripheral) -> Result<(BTreeMap<String, f64>, ReadQual
     for _ in 0..2 {
         commands.extend(protocol::FIELDS.iter().map(|(_, a, b, _)| vec![*a, *b]));
     }
+    let command_loop_start = Instant::now();
     for payload in commands {
         quality.commands_requested += 1;
+        let write_start = Instant::now();
         device
             .write(write, &protocol::command(&payload), WriteType::WithResponse)
             .await?;
+        timing.command_ms += write_start.elapsed().as_millis() as u64;
+
+        let response_start = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut matched = false;
         loop {
@@ -150,7 +180,13 @@ async fn collect(device: &Peripheral) -> Result<(BTreeMap<String, f64>, ReadQual
                 Ok(None) => bail!("Bluetooth notification stream ended"),
                 Err(_) => {
                     quality.commands_timed_out += 1;
-                    warn!(command = ?payload, "No response to command");
+                    let elapsed = response_start.elapsed().as_millis() as u64;
+                    timing.response_wait_ms += elapsed;
+                    warn!(
+                        command = ?payload,
+                        response_ms = elapsed,
+                        "No response to command"
+                    );
                     break;
                 }
             };
@@ -170,6 +206,15 @@ async fn collect(device: &Peripheral) -> Result<(BTreeMap<String, f64>, ReadQual
                         .iter()
                         .find(|(_, a, b, _)| *a == frame[4] && *b == frame[5])
                     {
+                        let elapsed = response_start.elapsed().as_millis() as u64;
+                        timing.response_wait_ms += elapsed;
+                        debug!(
+                            command = ?payload,
+                            response_ms = elapsed,
+                            field = %name,
+                            raw = raw,
+                            "Command response"
+                        );
                         *quality.samples_by_field.entry((*name).into()).or_insert(0) += 1;
                         samples
                             .entry((*name).into())
@@ -182,10 +227,15 @@ async fn collect(device: &Peripheral) -> Result<(BTreeMap<String, f64>, ReadQual
                 break;
             }
         }
+
+        let sleep_start = Instant::now();
         sleep(Duration::from_millis(500)).await;
+        timing.sleep_ms += sleep_start.elapsed().as_millis() as u64;
+
         if payload == [0, 9] {
             // Nonstandard access packet captured by upstream immediately after
             // SerialNumber. Its response is not a normal Delta framed reading.
+            let access_start = Instant::now();
             device
                 .write(
                     write,
@@ -193,9 +243,22 @@ async fn collect(device: &Peripheral) -> Result<(BTreeMap<String, f64>, ReadQual
                     WriteType::WithResponse,
                 )
                 .await?;
+            timing.command_ms += access_start.elapsed().as_millis() as u64;
+            let access_sleep_start = Instant::now();
             sleep(Duration::from_millis(500)).await;
+            timing.sleep_ms += access_sleep_start.elapsed().as_millis() as u64;
+        }
+
+        // Track slow commands (>1 s end-to-end) for tuning.
+        let command_elapsed = write_start.elapsed().as_millis() as u64;
+        if command_elapsed > 1000 {
+            timing
+                .slow_commands
+                .push((payload[0] as u16, payload[1] as u16, command_elapsed));
         }
     }
+    timing.command_ms += command_loop_start.elapsed().as_millis() as u64;
+
     if samples.is_empty() {
         bail!("No usable measurements received");
     }
@@ -263,7 +326,12 @@ struct Radio {
 }
 
 impl Radio {
-    async fn connect(&self, inverter: &Inverter, deadline: Instant) -> Result<Peripheral> {
+    async fn connect(
+        &self,
+        inverter: &Inverter,
+        deadline: Instant,
+        timing: &mut Timing,
+    ) -> Result<Peripheral> {
         let mut ready_at = timeout_at(deadline, self.ready_at.lock())
             .await
             .context("Timed out waiting for radio coordinator")?;
@@ -271,6 +339,7 @@ impl Radio {
             .await
             .context("Radio cooldown exceeded polling budget")?;
         debug!(stage = "discovery", "Refreshing Bluetooth discovery");
+        let scan_start = Instant::now();
         let discovered = timeout_at(
             deadline.min(Instant::now() + Duration::from_secs(10)),
             async {
@@ -286,20 +355,26 @@ impl Radio {
             .await
             .context("Stop discovery timed out")?
             .context("Stop discovery failed")?;
+        timing.scan_ms = scan_start.elapsed().as_millis() as u64;
         let device = discovered
             .context("Discovery timed out")??
             .into_iter()
             .find(|p| p.address().to_string() == inverter.mac)
             .context("Inverter not discovered")?;
         debug!(stage = "connect", "Establishing Bluetooth connection");
+        let connect_start = Instant::now();
         let connected = timeout_at(
             deadline.min(Instant::now() + Duration::from_secs(15)),
             device.connect(),
         )
         .await;
+        timing.connect_attempt_ms = connect_start.elapsed().as_millis() as u64;
         match connected {
             Ok(Ok(())) => {
-                info!("Bluetooth connected");
+                info!(
+                    connection_ms = timing.connect_attempt_ms,
+                    "Bluetooth connected"
+                );
                 Ok(device)
             }
             result => {
@@ -318,21 +393,36 @@ impl Radio {
         &self,
         inverter: &Inverter,
         deadline: Instant,
-    ) -> Result<(i64, BTreeMap<String, f64>, ReadQuality)> {
-        let device = self.connect(inverter, deadline).await?;
+    ) -> Result<(i64, BTreeMap<String, f64>, ReadQuality, Timing)> {
+        let cycle_start = Instant::now();
+
+        let mut timing = Timing::default();
+        let device = self.connect(inverter, deadline, &mut timing).await?;
+        info!(
+            connection_ms = timing.connect_attempt_ms,
+            scan_ms = timing.scan_ms,
+            "Bluetooth connected"
+        );
+
         let timestamp = chrono::Utc::now()
             .timestamp_nanos_opt()
             .expect("UTC timestamp fits i64");
-        let result = timeout_at(deadline, collect(&device))
+        let result = timeout_at(deadline, collect(&device, &mut timing))
             .await
             .context("Measurement read timed out");
+
         // Cleanup is outside the read timeout. Serializing it avoids overlapping
         // radio control operations and enforces a cooldown before the next connect.
         let mut ready_at = self.ready_at.lock().await;
+        let disconnect_start = Instant::now();
         disconnect(&device).await;
+        let disconnect_ms = disconnect_start.elapsed().as_millis() as u64;
         *ready_at = Instant::now() + Duration::from_secs(2);
+
         let (fields, quality) = result??;
-        Ok((timestamp, fields, quality))
+        timing.disconnect_ms = disconnect_ms;
+        timing.total_ms = cycle_start.elapsed().as_millis() as u64;
+        Ok((timestamp, fields, quality, timing))
     }
 }
 
@@ -405,7 +495,7 @@ async fn poll_inverter(
         .await;
         cycles += 1;
         match result {
-            Ok((timestamp, fields, quality)) => {
+            Ok((timestamp, fields, quality, timing)) => {
                 enqueue(&config.spool, &line(&inverter.serial, &fields, timestamp)).await?;
                 uploads.notify_one();
                 last_success = Some(Instant::now());
@@ -415,6 +505,11 @@ async fn poll_inverter(
                     .samples_by_field
                     .iter()
                     .map(|(name, count)| format!("{name}:{count}"))
+                    .collect();
+                let slow: Vec<String> = timing
+                    .slow_commands
+                    .iter()
+                    .map(|(a, b, ms)| format!("{a},{b}:{ms}ms"))
                     .collect();
                 let formatted_fields = fields
                     .iter()
@@ -426,6 +521,16 @@ async fn poll_inverter(
                     samples = %samples.join(","),
                     commands_timed_out = quality.commands_timed_out,
                     complete = complete,
+                    total_ms = timing.total_ms,
+                    connection_ms = timing.connect_attempt_ms,
+                    scan_ms = timing.scan_ms,
+                    service_discovery_ms = timing.service_discovery_ms,
+                    subscription_ms = timing.subscription_ms,
+                    command_ms = timing.command_ms,
+                    sleep_ms = timing.sleep_ms,
+                    response_wait_ms = timing.response_wait_ms,
+                    disconnect_ms = timing.disconnect_ms,
+                    slow_commands = ?slow,
                     "Queued measurements",
                 );
             }
