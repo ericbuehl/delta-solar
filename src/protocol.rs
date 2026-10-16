@@ -1,5 +1,5 @@
 //! Delta command framing/units ported from jat255/solar-inverter-datalogger.
-//! See THIRD_PARTY_LICENSES.md for attribution.
+
 pub const FIELDS: &[(&str, u8, u8, f64)] = &[
     ("DailyEnergy", 21, 45, 1000.0),
     ("Power", 51, 4, 1000.0),
