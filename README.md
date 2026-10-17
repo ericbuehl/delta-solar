@@ -80,27 +80,37 @@ Pacific-time display and use timezone-aware day boundaries for daily totals.
 Each inverter has an independent Tokio polling task with a default **60-second
 minimum interval**. `POLL_MODE=sequential` (the default) polls one inverter at a
 time. `POLL_MODE=concurrent` allows overlapping reads while a shared radio
-coordinator serializes discovery, connection attempts, and disconnects. Each
-connection attempt refreshes discovery for five seconds, then has up to 15
-seconds to connect. Once connected, the coordinator is released during service
-discovery and measurement collection so the other inverter can connect. A
-two-second cooldown follows disconnects, including cleanup after failed
-connections.
+coordinator serializes discovery, connection attempts, and disconnects. A shared
+radio coordinator serializes discovery, connection attempts, and disconnects.
+Successfully connected peripherals are cached, so the next cycle skips the full
+scan when the inverter is still advertising from the previous read.
 
 Each polling cycle allows up to **three attempts**, with randomized backoff of
 2–5 seconds before the second attempt and 4–7 seconds before the third. A shared
 90-second per-inverter budget (`POLL_TIMEOUT_SECONDS`) covers radio-coordinator
-waits, discovery, connection, reads, and retry backoff. Cleanup is allowed to
-finish after that budget: it may wait for another connection attempt, then spend
-up to five seconds disconnecting. Failed reads and connection attempts are
-retried; partial failed reads are discarded rather than merged across attempts.
-The next cycle starts after the configured interval, or at least one second after
-an overlong cycle finishes. Cycles for the **same** inverter never overlap.
+waits, discovery, connection, reads, and retry backoff. Failed reads and
+connection attempts are retried; partial failed reads are discarded rather than
+merged across attempts. The next cycle starts after the configured interval, or
+at least one second after an overlong cycle finishes. Cycles for the **same**
+inverter never overlap.
 
 `POLL_MODE=sequential` avoids overlapping Bluetooth sessions and is recommended
 for this Pi and inverter combination. Concurrent reads cannot overcome another
 client holding an inverter's only BLE connection, but they add variable connection
 contention.
+
+Bluetooth timing can be tuned with environment variables:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SCAN_DURATION_SECONDS` | `2` | Seconds to scan for inverter advertisements per connection attempt |
+| `INTER_COMMAND_SLEEP_MS` | `100` | Milliseconds between each GATT command during a read |
+| `DISCONNECT_TIMEOUT_SECONDS` | `3` | Maximum seconds to wait for Bluetooth disconnect cleanup |
+
+The previous defaults (5s scan, 500ms inter-command sleep, 5s disconnect) added
+about 23s of fixed overhead per read. Current defaults cut that to roughly 7–9s.
+If you see `No response to command` warnings, increase `INTER_COMMAND_SLEEP_MS`
+or `POLL_TIMEOUT_SECONDS`.
 
 Logs include the inverter serial, attempt number, complete error chain, and a
 per-inverter status summary (`cycles`, `successes`, `seconds_since_success`).

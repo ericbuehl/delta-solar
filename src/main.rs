@@ -62,6 +62,9 @@ struct Config {
     poll_timeout: Duration,
     adapter: usize,
     concurrent: bool,
+    scan_duration_seconds: u64,
+    inter_command_sleep_ms: u64,
+    disconnect_timeout_seconds: u64,
 }
 
 fn setting(key: &str, default: &str) -> String {
@@ -99,8 +102,20 @@ impl Config {
         }
         let interval: u64 = setting("POLL_INTERVAL_SECONDS", "60").parse()?;
         let poll_timeout: u64 = setting("POLL_TIMEOUT_SECONDS", "90").parse()?;
+        let scan_duration: u64 = setting("SCAN_DURATION_SECONDS", "2").parse()?;
+        let inter_command_sleep: u64 = setting("INTER_COMMAND_SLEEP_MS", "100").parse()?;
+        let disconnect_timeout: u64 = setting("DISCONNECT_TIMEOUT_SECONDS", "3").parse()?;
         if interval == 0 || poll_timeout == 0 {
             bail!("Polling durations must be positive");
+        }
+        if scan_duration == 0 {
+            bail!("SCAN_DURATION_SECONDS must be positive");
+        }
+        if inter_command_sleep == 0 {
+            bail!("INTER_COMMAND_SLEEP_MS must be positive");
+        }
+        if disconnect_timeout == 0 {
+            bail!("DISCONNECT_TIMEOUT_SECONDS must be positive");
         }
         Ok(Self {
             inverters,
@@ -115,11 +130,15 @@ impl Config {
                 "sequential" => false,
                 _ => bail!("POLL_MODE must be concurrent or sequential"),
             },
+            scan_duration_seconds: scan_duration,
+            inter_command_sleep_ms: inter_command_sleep,
+            disconnect_timeout_seconds: disconnect_timeout,
         })
     }
 }
 
 async fn collect(
+    config: &Config,
     device: &Peripheral,
     timing: &mut Timing,
 ) -> Result<(BTreeMap<String, f64>, ReadQuality)> {
@@ -229,7 +248,7 @@ async fn collect(
         }
 
         let sleep_start = Instant::now();
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(config.inter_command_sleep_ms)).await;
         timing.sleep_ms += sleep_start.elapsed().as_millis() as u64;
 
         if payload == [0, 9] {
@@ -245,7 +264,7 @@ async fn collect(
                 .await?;
             timing.command_ms += access_start.elapsed().as_millis() as u64;
             let access_sleep_start = Instant::now();
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(config.inter_command_sleep_ms)).await;
             timing.sleep_ms += access_sleep_start.elapsed().as_millis() as u64;
         }
 
@@ -323,11 +342,13 @@ async fn flush(client: &reqwest::Client, config: &Config) -> Result<()> {
 struct Radio {
     adapter: Adapter,
     ready_at: Mutex<Instant>,
+    cache: Mutex<BTreeMap<String, Peripheral>>,
 }
 
 impl Radio {
     async fn connect(
         &self,
+        config: &Config,
         inverter: &Inverter,
         deadline: Instant,
         timing: &mut Timing,
@@ -338,13 +359,41 @@ impl Radio {
         timeout_at(deadline, sleep_until(*ready_at))
             .await
             .context("Radio cooldown exceeded polling budget")?;
+
+        // Try the cached peripheral first—avoids a full scan cycle when the
+        // inverter is still advertising from the previous read.
+        {
+            let cache = self.cache.lock().await;
+            if let Some(cached) = cache.get(&inverter.mac) {
+                let connect_start = Instant::now();
+                let connected = timeout_at(
+                    deadline.min(Instant::now() + Duration::from_secs(10)),
+                    cached.connect(),
+                )
+                .await;
+                timing.connect_attempt_ms = connect_start.elapsed().as_millis() as u64;
+                match connected {
+                    Ok(Ok(())) => {
+                        info!(
+                            connection_ms = timing.connect_attempt_ms,
+                            "Bluetooth connected (cached)"
+                        );
+                        return Ok(cached.clone());
+                    }
+                    _ => {
+                        // Fall through to discovery below.
+                    }
+                }
+            }
+        }
+
         debug!(stage = "discovery", "Refreshing Bluetooth discovery");
         let scan_start = Instant::now();
         let discovered = timeout_at(
             deadline.min(Instant::now() + Duration::from_secs(10)),
             async {
                 self.adapter.start_scan(ScanFilter::default()).await?;
-                sleep(Duration::from_secs(5)).await;
+                sleep(Duration::from_secs(config.scan_duration_seconds)).await;
                 self.adapter.peripherals().await
             },
         )
@@ -364,7 +413,7 @@ impl Radio {
         debug!(stage = "connect", "Establishing Bluetooth connection");
         let connect_start = Instant::now();
         let connected = timeout_at(
-            deadline.min(Instant::now() + Duration::from_secs(15)),
+            deadline.min(Instant::now() + Duration::from_secs(10)),
             device.connect(),
         )
         .await;
@@ -375,10 +424,14 @@ impl Radio {
                     connection_ms = timing.connect_attempt_ms,
                     "Bluetooth connected"
                 );
+                self.cache
+                    .lock()
+                    .await
+                    .insert(inverter.mac.clone(), device.clone());
                 Ok(device)
             }
             result => {
-                disconnect(&device).await;
+                disconnect(&device, config.disconnect_timeout_seconds).await;
                 *ready_at = Instant::now() + Duration::from_secs(2);
                 match result {
                     Ok(Err(error)) => Err(error).context("Bluetooth connection failed"),
@@ -391,13 +444,16 @@ impl Radio {
 
     async fn read(
         &self,
+        config: &Config,
         inverter: &Inverter,
         deadline: Instant,
     ) -> Result<(i64, BTreeMap<String, f64>, ReadQuality, Timing)> {
         let cycle_start = Instant::now();
 
         let mut timing = Timing::default();
-        let device = self.connect(inverter, deadline, &mut timing).await?;
+        let device = self
+            .connect(config, inverter, deadline, &mut timing)
+            .await?;
         info!(
             connection_ms = timing.connect_attempt_ms,
             scan_ms = timing.scan_ms,
@@ -407,7 +463,7 @@ impl Radio {
         let timestamp = chrono::Utc::now()
             .timestamp_nanos_opt()
             .expect("UTC timestamp fits i64");
-        let result = timeout_at(deadline, collect(&device, &mut timing))
+        let result = timeout_at(deadline, collect(config, &device, &mut timing))
             .await
             .context("Measurement read timed out");
 
@@ -415,7 +471,7 @@ impl Radio {
         // radio control operations and enforces a cooldown before the next connect.
         let mut ready_at = self.ready_at.lock().await;
         let disconnect_start = Instant::now();
-        disconnect(&device).await;
+        disconnect(&device, config.disconnect_timeout_seconds).await;
         let disconnect_ms = disconnect_start.elapsed().as_millis() as u64;
         *ready_at = Instant::now() + Duration::from_secs(2);
 
@@ -426,9 +482,9 @@ impl Radio {
     }
 }
 
-async fn disconnect(device: &Peripheral) {
+async fn disconnect(device: &Peripheral, timeout_seconds: u64) {
     info!(stage = "disconnect", "Disconnecting Bluetooth");
-    match timeout(Duration::from_secs(5), device.disconnect()).await {
+    match timeout(Duration::from_secs(timeout_seconds), device.disconnect()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!(%error, "Bluetooth disconnect failed"),
         Err(_) => warn!("Bluetooth disconnect timed out"),
@@ -490,7 +546,7 @@ async fn poll_inverter(
         let slot = slots.acquire().await?;
         let started = Instant::now();
         let result = retry_read(started + config.poll_timeout, |deadline| {
-            radio.read(inverter, deadline)
+            radio.read(config, inverter, deadline)
         })
         .await;
         cycles += 1;
@@ -576,6 +632,7 @@ async fn run(config: Config) -> Result<()> {
     let radio = Radio {
         adapter: adapter.clone(),
         ready_at: Mutex::new(Instant::now()),
+        cache: Mutex::new(BTreeMap::new()),
     };
     let slots = Semaphore::new(if config.concurrent {
         config.inverters.len()
@@ -729,6 +786,9 @@ mod tests {
             poll_timeout: Duration::from_secs(90),
             adapter: 0,
             concurrent: true,
+            scan_duration_seconds: 2,
+            inter_command_sleep_ms: 100,
+            disconnect_timeout_seconds: 3,
         };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
