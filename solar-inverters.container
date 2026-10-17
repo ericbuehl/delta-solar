@@ -1,5 +1,5 @@
 [Unit]
-Description=Delta M4 solar inverter collector (1010 and 1006)
+Description=Delta M4 solar inverter collector
 Wants=network-online.target bluetooth.service
 After=network-online.target bluetooth.service
 Requires=dbus.service

@@ -706,15 +706,15 @@ mod tests {
                 bail!("Simulated connection contention");
             }
             assert_eq!(healthy.load(Ordering::SeqCst), 1);
-            Ok(1010)
+            Ok("example-a")
         });
         let working = retry_read(deadline, |_| async {
             healthy.fetch_add(1, Ordering::SeqCst);
-            Ok(1006)
+            Ok("example-b")
         });
         let (retrying, working) = tokio::join!(retrying, working);
-        assert_eq!(retrying.unwrap(), 1010);
-        assert_eq!(working.unwrap(), 1006);
+        assert_eq!(retrying.unwrap(), "example-a");
+        assert_eq!(working.unwrap(), "example-b");
         assert_eq!(failures.load(Ordering::SeqCst), 3);
     }
 
@@ -741,8 +741,8 @@ mod tests {
     async fn concurrent_producers_preserve_distinct_spool_entries() -> Result<()> {
         let spool = env::temp_dir().join(format!("delta-solar-test-{}", Uuid::new_v4()));
         fs::create_dir(&spool).await?;
-        let a = "inverter_data,serial=1010 Power=1 123\n";
-        let b = "inverter_data,serial=1006 Power=2 123\n";
+        let a = "inverter_data,serial=example-a Power=1 123\n";
+        let b = "inverter_data,serial=example-b Power=2 123\n";
         tokio::try_join!(enqueue(&spool, a), enqueue(&spool, b))?;
         let mut entries = fs::read_dir(&spool).await?;
         let mut lines = Vec::new();
@@ -751,7 +751,7 @@ mod tests {
             lines.push(fs::read_to_string(entry.path()).await?);
         }
         lines.sort();
-        assert_eq!(lines, vec![b, a]);
+        assert_eq!(lines, vec![a, b]);
         fs::remove_dir_all(&spool).await?;
         Ok(())
     }
@@ -761,12 +761,12 @@ mod tests {
         let spool = env::temp_dir().join(format!("delta-solar-test-{}", Uuid::new_v4()));
         fs::create_dir(&spool).await?;
         let fields = BTreeMap::from([("Power".into(), 0.0)]);
-        let point = line("1010", &fields, 123456789);
+        let point = line("example-a", &fields, 123456789);
         assert_eq!(
             point,
-            "inverter_data,model=M4-TL-US,serial=1010 Power=0 123456789\n"
+            "inverter_data,model=M4-TL-US,serial=example-a Power=0 123456789\n"
         );
-        assert_ne!(point, line("1006", &fields, 123456789));
+        assert_ne!(point, line("example-b", &fields, 123456789));
         enqueue(&spool, &point).await?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}", listener.local_addr()?);

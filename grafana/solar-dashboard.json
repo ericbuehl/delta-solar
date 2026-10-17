@@ -50,10 +50,7 @@
       "gridPos": {"x": 0, "y": 3, "w": 12, "h": 4},
       "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"},
       "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT LAST(\"Power\") FROM \"inverter_data\" WHERE time > now() - 5m AND time <= now() AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY \"serial\""}],
-      "fieldConfig": {"defaults": {"unit": "kwatt", "decimals": 2, "min": 0, "noValue": "No recent sample", "color": {"mode": "palette-classic"}}, "overrides": [
-        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
-        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
-      ]},
+      "fieldConfig": {"defaults": {"unit": "kwatt", "decimals": 2, "min": 0, "noValue": "No recent sample", "color": {"mode": "palette-classic-by-name"}}, "overrides": []},
       "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "value_and_name", "colorMode": "value", "graphMode": "none", "justifyMode": "auto"}
     },
     {
@@ -62,10 +59,7 @@
       "gridPos": {"x": 12, "y": 3, "w": 12, "h": 4},
       "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"},
       "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT LAST(\"DailyEnergy\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY \"serial\""}],
-      "fieldConfig": {"defaults": {"unit": "kwatth", "decimals": 2, "min": 0, "noValue": "No sample", "color": {"mode": "palette-classic"}}, "overrides": [
-        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
-        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
-      ]},
+      "fieldConfig": {"defaults": {"unit": "kwatth", "decimals": 2, "min": 0, "noValue": "No sample", "color": {"mode": "palette-classic-by-name"}}, "overrides": []},
       "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}, "orientation": "auto", "textMode": "value_and_name", "colorMode": "value", "graphMode": "none", "justifyMode": "auto"}
     },
     {
@@ -74,10 +68,7 @@
       "gridPos": {"x": 0, "y": 7, "w": 12, "h": 8},
       "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
       "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT MEAN(\"Power\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
-      "fieldConfig": {"defaults": {"unit": "kwatt", "decimals": 2, "min": 0, "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": false, "showPoints": "never"}}, "overrides": [
-        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
-        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
-      ]},
+      "fieldConfig": {"defaults": {"unit": "kwatt", "decimals": 2, "min": 0, "color": {"mode": "palette-classic-by-name"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": false, "showPoints": "never"}}, "overrides": []},
       "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
     },
     {
@@ -86,10 +77,7 @@
       "gridPos": {"x": 12, "y": 7, "w": 12, "h": 8},
       "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
       "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT MEAN(\"Power\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
-      "fieldConfig": {"defaults": {"unit": "kwatt", "decimals": 2, "min": 0, "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 45, "spanNulls": false, "showPoints": "never", "stacking": {"mode": "normal", "group": "production"}}}, "overrides": [
-        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
-        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
-      ]},
+      "fieldConfig": {"defaults": {"unit": "kwatt", "decimals": 2, "min": 0, "color": {"mode": "palette-classic-by-name"}, "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 45, "spanNulls": false, "showPoints": "never", "stacking": {"mode": "normal", "group": "production"}}}, "overrides": []},
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "desc"}}
     },
     {
@@ -98,10 +86,7 @@
       "gridPos": {"x": 0, "y": 15, "w": 24, "h": 7},
       "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
       "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT LAST(\"DailyEnergy\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
-      "fieldConfig": {"defaults": {"unit": "kwatth", "decimals": 2, "min": 0, "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 5, "spanNulls": false}}, "overrides": [
-        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
-        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
-      ]},
+      "fieldConfig": {"defaults": {"unit": "kwatth", "decimals": 2, "min": 0, "color": {"mode": "palette-classic-by-name"}, "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 5, "spanNulls": false}}, "overrides": []},
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "none"}}
     },
     {
@@ -109,10 +94,7 @@
       "gridPos": {"x": 0, "y": 22, "w": 8, "h": 7},
       "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
       "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT MEAN(\"ACVoltage\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
-      "fieldConfig": {"defaults": {"unit": "volt", "decimals": 1, "color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2, "spanNulls": false}}, "overrides": [
-        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
-        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
-      ]},
+      "fieldConfig": {"defaults": {"unit": "volt", "decimals": 1, "color": {"mode": "palette-classic-by-name"}, "custom": {"lineWidth": 2, "spanNulls": false}}, "overrides": []},
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "none"}}
     },
     {
@@ -120,10 +102,7 @@
       "gridPos": {"x": 8, "y": 22, "w": 8, "h": 7},
       "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
       "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT MEAN(\"ACCurrent\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
-      "fieldConfig": {"defaults": {"unit": "amp", "decimals": 2, "min": 0, "color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2, "spanNulls": false}}, "overrides": [
-        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
-        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
-      ]},
+      "fieldConfig": {"defaults": {"unit": "amp", "decimals": 2, "min": 0, "color": {"mode": "palette-classic-by-name"}, "custom": {"lineWidth": 2, "spanNulls": false}}, "overrides": []},
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "none"}}
     },
     {
@@ -131,10 +110,7 @@
       "gridPos": {"x": 16, "y": 22, "w": 8, "h": 7},
       "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
       "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT MEAN(\"ACFrequency\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time($__interval), \"serial\" fill(null)"}],
-      "fieldConfig": {"defaults": {"unit": "hertz", "decimals": 2, "color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2, "spanNulls": false}}, "overrides": [
-        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
-        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
-      ]},
+      "fieldConfig": {"defaults": {"unit": "hertz", "decimals": 2, "color": {"mode": "palette-classic-by-name"}, "custom": {"lineWidth": 2, "spanNulls": false}}, "overrides": []},
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "none"}}
     },
     {
@@ -173,10 +149,7 @@
       "gridPos": {"x": 12, "y": 43, "w": 12, "h": 7},
       "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
       "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT COUNT(\"Power\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time(1m), \"serial\" fill(0)"}],
-      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "min": 0, "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineInterpolation": "stepAfter", "lineWidth": 2, "fillOpacity": 10, "spanNulls": false}}, "overrides": [
-        {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
-        {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}
-      ]},
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "min": 0, "color": {"mode": "palette-classic-by-name"}, "custom": {"drawStyle": "line", "lineInterpolation": "stepAfter", "lineWidth": 2, "fillOpacity": 10, "spanNulls": false}}, "overrides": []},
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "calcs": []}, "tooltip": {"mode": "multi", "sort": "none"}}
     }
   ]

@@ -1,6 +1,6 @@
 # Delta solar collector
 
-Rust/Tokio collector for two Delta M4-TL-US inverters on a Raspberry Pi 5
+Rust/Tokio collector for Delta M4-TL-US inverters on a Raspberry Pi 5
 running **64-bit Debian Trixie**. One rootful Podman Quadlet uses host BlueZ
 over D-Bus and writes to the host's **InfluxDB 1.x**, database **solar**, without
 authentication. The Dockerfile produces a standard OCI image usable by Docker
@@ -38,12 +38,21 @@ Build in root's Podman image store, then install the configuration:
 ```sh
 sudo podman build -t localhost/delta-solar:latest -f Dockerfile .
 sudo install -m 0644 solar-inverters.env.example /etc/solar-inverters.env
+sudoedit /etc/solar-inverters.env
 sudo install -d /etc/containers/systemd
 sudo install -m 0644 solar-inverters.container /etc/containers/systemd/
 sudo systemctl daemon-reload
 sudo systemctl start solar-inverters.service
 sudo journalctl -u solar-inverters.service -f
 ```
+
+Before starting the service, replace the example `INVERTERS` entries in
+`/etc/solar-inverters.env` with your installation's comma-separated `serial=MAC`
+pairs. Each identifier and MAC must be unique; identifiers may contain ASCII
+letters, digits, and hyphens. The collector loads these identifiers from the
+environment and writes them as InfluxDB `serial` tags; Grafana discovers them
+from those tags. Keep identifiers stable to preserve continuity with existing
+data. Local `*.env` files are ignored by Git.
 
 Quadlet's `[Install]` section arranges boot startup when the generator runs;
 do not `systemctl enable` the generated service. The named Podman volume
@@ -144,7 +153,7 @@ attempt; `total_ms` excludes earlier failed read attempts and retry backoff.
 Every completed read is written to the spool before upload. Failed HTTP writes
 retain the original line and timestamp for retry; resending a point is
 idempotent for the same series/timestamp. A **single independent upload worker**
-handles both producers, so uploads do not block Bluetooth polling or race over
+handles all inverter producers, so uploads do not block Bluetooth polling or race over
 queued files. It wakes on new readings or every ten seconds, processes up to
 100 directory entries per pass, and stops the pass on an upload error. Failures
 have a minimum ten-second retry delay. Successful uploads are logged individually.
@@ -160,8 +169,8 @@ curl --fail-with-body -G http://127.0.0.1:8086/query \
   --data-urlencode 'q=SELECT LAST("Power") FROM "inverter_data" GROUP BY "serial"'
 ```
 
-Expect separate series for `1010` and `1006`. Nighttime/offline inverters may
-not advertise or respond. For troubleshooting, set
+Expect a separate series for each configured inverter. Nighttime/offline inverters
+may not advertise or respond. For troubleshooting, set
 `RUST_LOG=delta_solar=debug,btleplug=debug` in `/etc/solar-inverters.env` and
 restart the service. Check `sudo bluetoothctl show`, `sudo systemctl status
 bluetooth`, and the journal for discovery, characteristic or command timeouts.
@@ -199,9 +208,11 @@ The dashboard includes:
 
 The **Inverter** selector discovers serial tags automatically and defaults to all
 inverters. Time display is `America/Los_Angeles`, the initial range is 24 hours,
-and refresh is every minute. Inverters 1006 and 1010 have consistent blue and
-orange colors. The **recent power** card always queries the last five minutes of
-wall-clock time, even when viewing a historical date range; other panels follow
+and refresh is every minute. Series colors are assigned automatically by name.
+The selector reloads its inverter list when the dashboard loads; reload after a
+new inverter has written data to discover it. The **recent power** card always
+queries the last five minutes of wall-clock time, even when viewing a historical
+date range; other panels follow
 the date picker. An inverter without recent data may disappear from that card.
 
 `DailyEnergy` is labeled **Reported energy counter** because its reset behavior
@@ -221,8 +232,8 @@ avoid that particular shift. Edge buckets may be partial.
 
 If panels are empty, verify the datasource database and widen the time range
 (inverters may be offline at night). The query in **Verify collection** above
-checks whether `Power` exists for both serials. Use a panel's **Inspect → Query**
-to troubleshoot datasource errors. The JSON uses an import-time `${DS_SOLAR}`
+checks whether `Power` exists for each configured identifier. Use a panel's
+**Inspect → Query** to troubleshoot datasource errors. The JSON uses an import-time `${DS_SOLAR}`
 placeholder; for file provisioning instead of UI import, replace it with your
 actual InfluxDB datasource UID and remove `__inputs`.
 
@@ -246,5 +257,5 @@ cargo clippy --locked --all-targets -- -D warnings
 The Docker build runs tests on Linux before compiling the release binary.
 Build on the Pi for native ARM64, or use a builder configured for linux/arm64.
 Local protocol tests do not establish that the device handshake works: final
-acceptance requires connecting to both inverters on the Pi and confirming
+acceptance requires connecting to the configured inverters on the Pi and confirming
 separate measurements in InfluxDB.
