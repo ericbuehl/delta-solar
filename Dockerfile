@@ -3,10 +3,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends libdbus-1-dev p
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs
-RUN cargo build --locked --release
 COPY src ./src
-RUN cargo test --locked && cargo build --locked --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo test --locked && cargo build --locked --release
 
 FROM docker.io/library/debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends libdbus-1-3 ca-certificates tzdata \
