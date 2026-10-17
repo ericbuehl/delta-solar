@@ -72,7 +72,12 @@ behavior must be verified on these devices. This version does not manufacture
 using derived fields need adjustment. Filter/group by `serial` to distinguish
 inverters.
 
-Timestamps are UTC nanoseconds, taken at the start of each inverter read.
+Timestamps are UTC nanoseconds, taken once when each inverter acquires its polling
+slot and starts a polling cycle, before connection attempts. All retries in that
+cycle share the timestamp, so a delayed connection does not move a successful
+cycle into the next minute's graph bucket. This labels the cycle start rather
+than the exact measurement acquisition time; failed or delayed cycles can still
+leave gaps.
 `TZ=America/Los_Angeles` configures the container's local timezone; logs and
 stored timestamps remain UTC. Set dashboards to America/Los_Angeles for
 Pacific-time display and use timezone-aware day boundaries for daily totals.
@@ -84,6 +89,10 @@ coordinator serializes discovery, connection attempts, and disconnects. A shared
 radio coordinator serializes discovery, connection attempts, and disconnects.
 Successfully connected peripherals are cached, so the next cycle skips the full
 scan when the inverter is still advertising from the previous read.
+Failed cached connections are logged and evicted from the cache, then receive
+bounded disconnect cleanup and a two-second radio cooldown before discovery and
+another connection attempt. Cleanup failures and timeouts are logged explicitly;
+recovery waits count against the polling budget.
 
 Each polling cycle allows up to **three attempts**, with randomized backoff of
 2–5 seconds before the second attempt and 4–7 seconds before the third. A shared
@@ -126,6 +135,11 @@ Each queued-measurement log includes:
 - **`commands_timed_out=N`**: number of commands that received no response.
 Debug logging adds discovery, connection, read, and disconnect stages. Field
 values in logs are rounded to three decimal places; stored precision is unchanged.
+`command_ms` measures the full command loop once, including writes, response
+waits, and inter-command sleeps. `sleep_ms` and `response_wait_ms` are components
+of that duration, not additional phases to add to it. `connection_ms` includes
+both cached and post-discovery connection attempts within the successful read
+attempt; `total_ms` excludes earlier failed read attempts and retry backoff.
 
 Every completed read is written to the spool before upload. Failed HTTP writes
 retain the original line and timestamp for retry; resending a point is
@@ -181,7 +195,7 @@ The dashboard includes:
 - Per-inverter and stacked production charts, plus energy-counter trends.
 - AC voltage, current, and frequency.
 - PV1–PV4 voltage and current panels repeated for each selected inverter.
-- Last Power sample timestamps and Power sample counts per five-minute bucket.
+- Last Power sample timestamps and Power sample counts per one-minute bucket.
 
 The **Inverter** selector discovers serial tags automatically and defaults to all
 inverters. Time display is `America/Los_Angeles`, the initial range is 24 hours,
@@ -198,6 +212,12 @@ Sample counts measure stored `Power` fields, not polling success rate; zero coun
 do not imply zero production. Delayed uploads retain original timestamps and can
 backfill historical gaps. Collector retry/error metrics are available in logs,
 not in this measurement.
+
+With 60-second polling, expect one Power sample per complete minute. A zero-count
+minute followed by a two-count minute can indicate uneven timing rather than a
+lost sample. Historical readings timestamped at connection time can show this
+pattern when a retry crossed a minute boundary; current cycle-start timestamps
+avoid that particular shift. Edge buckets may be partial.
 
 If panels are empty, verify the datasource database and widen the time range
 (inverters may be offline at night). The query in **Verify collection** above

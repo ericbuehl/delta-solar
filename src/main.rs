@@ -183,7 +183,6 @@ async fn collect(
         device
             .write(write, &protocol::command(&payload), WriteType::WithResponse)
             .await?;
-        timing.command_ms += write_start.elapsed().as_millis() as u64;
 
         let response_start = Instant::now();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -254,7 +253,6 @@ async fn collect(
         if payload == [0, 9] {
             // Nonstandard access packet captured by upstream immediately after
             // SerialNumber. Its response is not a normal Delta framed reading.
-            let access_start = Instant::now();
             device
                 .write(
                     write,
@@ -262,7 +260,6 @@ async fn collect(
                     WriteType::WithResponse,
                 )
                 .await?;
-            timing.command_ms += access_start.elapsed().as_millis() as u64;
             let access_sleep_start = Instant::now();
             sleep(Duration::from_millis(config.inter_command_sleep_ms)).await;
             timing.sleep_ms += access_sleep_start.elapsed().as_millis() as u64;
@@ -362,27 +359,41 @@ impl Radio {
 
         // Try the cached peripheral first—avoids a full scan cycle when the
         // inverter is still advertising from the previous read.
-        {
-            let cache = self.cache.lock().await;
-            if let Some(cached) = cache.get(&inverter.mac) {
-                let connect_start = Instant::now();
-                let connected = timeout_at(
-                    deadline.min(Instant::now() + Duration::from_secs(10)),
-                    cached.connect(),
-                )
-                .await;
-                timing.connect_attempt_ms = connect_start.elapsed().as_millis() as u64;
-                match connected {
-                    Ok(Ok(())) => {
-                        info!(
-                            connection_ms = timing.connect_attempt_ms,
-                            "Bluetooth connected (cached)"
-                        );
-                        return Ok(cached.clone());
-                    }
-                    _ => {
-                        // Fall through to discovery below.
-                    }
+        let cached = self.cache.lock().await.get(&inverter.mac).cloned();
+        if let Some(cached) = cached {
+            let connect_start = Instant::now();
+            let connected = timeout_at(
+                deadline.min(Instant::now() + Duration::from_secs(10)),
+                cached.connect(),
+            )
+            .await;
+            timing.connect_attempt_ms = connect_start.elapsed().as_millis() as u64;
+            match connected {
+                Ok(Ok(())) => {
+                    info!(
+                        connection_ms = timing.connect_attempt_ms,
+                        "Bluetooth connected (cached)"
+                    );
+                    return Ok(cached);
+                }
+                result => {
+                    let error = match result {
+                        Ok(Err(error)) => format!("{error:#}"),
+                        Err(error) => format!("Cached Bluetooth connection timed out: {error}"),
+                        _ => unreachable!(),
+                    };
+                    warn!(
+                        connection_ms = timing.connect_attempt_ms,
+                        %error,
+                        "Cached Bluetooth connection failed; cleaning up before discovery"
+                    );
+                    self.cache.lock().await.remove(&inverter.mac);
+                    let disconnected = disconnect(&cached, config.disconnect_timeout_seconds).await;
+                    info!(disconnected, "Cached connection cleanup finished");
+                    *ready_at = Instant::now() + Duration::from_secs(2);
+                    timeout_at(deadline, sleep_until(*ready_at))
+                        .await
+                        .context("Cached connection recovery exceeded polling budget")?;
                 }
             }
         }
@@ -417,7 +428,7 @@ impl Radio {
             device.connect(),
         )
         .await;
-        timing.connect_attempt_ms = connect_start.elapsed().as_millis() as u64;
+        timing.connect_attempt_ms += connect_start.elapsed().as_millis() as u64;
         match connected {
             Ok(Ok(())) => {
                 info!(
@@ -447,7 +458,7 @@ impl Radio {
         config: &Config,
         inverter: &Inverter,
         deadline: Instant,
-    ) -> Result<(i64, BTreeMap<String, f64>, ReadQuality, Timing)> {
+    ) -> Result<(BTreeMap<String, f64>, ReadQuality, Timing)> {
         let cycle_start = Instant::now();
 
         let mut timing = Timing::default();
@@ -460,9 +471,6 @@ impl Radio {
             "Bluetooth connected"
         );
 
-        let timestamp = chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .expect("UTC timestamp fits i64");
         let result = timeout_at(deadline, collect(config, &device, &mut timing))
             .await
             .context("Measurement read timed out");
@@ -471,23 +479,30 @@ impl Radio {
         // radio control operations and enforces a cooldown before the next connect.
         let mut ready_at = self.ready_at.lock().await;
         let disconnect_start = Instant::now();
-        disconnect(&device, config.disconnect_timeout_seconds).await;
+        let disconnected = disconnect(&device, config.disconnect_timeout_seconds).await;
         let disconnect_ms = disconnect_start.elapsed().as_millis() as u64;
+        debug!(disconnected, disconnect_ms, "Bluetooth cleanup finished");
         *ready_at = Instant::now() + Duration::from_secs(2);
 
         let (fields, quality) = result??;
         timing.disconnect_ms = disconnect_ms;
         timing.total_ms = cycle_start.elapsed().as_millis() as u64;
-        Ok((timestamp, fields, quality, timing))
+        Ok((fields, quality, timing))
     }
 }
 
-async fn disconnect(device: &Peripheral, timeout_seconds: u64) {
+async fn disconnect(device: &Peripheral, timeout_seconds: u64) -> bool {
     info!(stage = "disconnect", "Disconnecting Bluetooth");
     match timeout(Duration::from_secs(timeout_seconds), device.disconnect()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "Bluetooth disconnect failed"),
-        Err(_) => warn!("Bluetooth disconnect timed out"),
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            warn!(%error, "Bluetooth disconnect failed");
+            false
+        }
+        Err(_) => {
+            warn!("Bluetooth disconnect timed out");
+            false
+        }
     }
 }
 
@@ -545,13 +560,17 @@ async fn poll_inverter(
         // concurrent mode permits one independent worker per inverter.
         let slot = slots.acquire().await?;
         let started = Instant::now();
+        // Label the cycle consistently even when a retry connects in a later minute.
+        let timestamp = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .expect("UTC timestamp fits i64");
         let result = retry_read(started + config.poll_timeout, |deadline| {
             radio.read(config, inverter, deadline)
         })
         .await;
         cycles += 1;
         match result {
-            Ok((timestamp, fields, quality, timing)) => {
+            Ok((fields, quality, timing)) => {
                 enqueue(&config.spool, &line(&inverter.serial, &fields, timestamp)).await?;
                 uploads.notify_one();
                 last_success = Some(Instant::now());

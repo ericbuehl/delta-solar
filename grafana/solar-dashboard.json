@@ -168,11 +168,11 @@
       "options": {"showHeader": true, "cellHeight": "sm", "sortBy": [{"displayName": "Time", "desc": true}]}
     },
     {
-      "id": 13, "type": "timeseries", "title": "Power samples received · per 5 minutes",
-      "description": "Count of stored Power samples, not polling success rate. Around five per complete bucket is typical with 60-second polling. Retries, missing Power fields and offline/nighttime devices reduce counts; spool replay can backfill old buckets. Edge buckets may be partial. Empty buckets are zero counts, not zero production.",
+      "id": 13, "type": "timeseries", "title": "Power samples received · per minute",
+      "description": "Count of stored Power samples, not polling success rate. One per complete minute is typical with 60-second polling. A zero followed by two can indicate a delayed reading crossing a minute boundary rather than a lost sample. Failed polls, missing Power fields and offline/nighttime devices can reduce counts; spool replay can backfill old buckets. Edge buckets may be partial. Empty buckets are zero counts, not zero production.",
       "gridPos": {"x": 12, "y": 43, "w": 12, "h": 7},
-      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "5m",
-      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT COUNT(\"Power\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time(5m), \"serial\" fill(0)"}],
+      "datasource": {"type": "influxdb", "uid": "${DS_SOLAR}"}, "interval": "1m",
+      "targets": [{"refId": "A", "rawQuery": true, "resultFormat": "time_series", "alias": "Inverter $tag_serial", "query": "SELECT COUNT(\"Power\") FROM \"inverter_data\" WHERE $timeFilter AND \"model\" = 'M4-TL-US' AND \"serial\" =~ /^${serial:regex}$/ GROUP BY time(1m), \"serial\" fill(0)"}],
       "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "min": 0, "color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "lineInterpolation": "stepAfter", "lineWidth": 2, "fillOpacity": 10, "spanNulls": false}}, "overrides": [
         {"matcher": {"id": "byName", "options": "Inverter 1006"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
         {"matcher": {"id": "byName", "options": "Inverter 1010"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]}

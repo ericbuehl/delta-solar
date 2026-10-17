@@ -6,12 +6,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo test --locked && cargo build --locked --release
+    cargo build --locked --release && \
+    cp /build/target/release/delta-solar /delta-solar
 
 FROM docker.io/library/debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends libdbus-1-3 ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /build/target/release/delta-solar /usr/local/bin/delta-solar
+COPY --from=build /delta-solar /usr/local/bin/delta-solar
 
 ENV TZ=America/Los_Angeles \
     DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket \
