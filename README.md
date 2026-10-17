@@ -81,8 +81,8 @@ behavior must be verified on these devices. This version does not manufacture
 using derived fields need adjustment. Filter/group by `serial` to distinguish
 inverters.
 
-Timestamps are UTC nanoseconds, taken once when each inverter acquires its polling
-slot and starts a polling cycle, before connection attempts. All retries in that
+Timestamps are UTC nanoseconds, taken once when each inverter starts a polling
+cycle, before waiting for a polling slot or attempting a connection. All retries in that
 cycle share the timestamp, so a delayed connection does not move a successful
 cycle into the next minute's graph bucket. This labels the cycle start rather
 than the exact measurement acquisition time; failed or delayed cycles can still
@@ -92,21 +92,30 @@ stored timestamps remain UTC. Set dashboards to America/Los_Angeles for
 Pacific-time display and use timezone-aware day boundaries for daily totals.
 
 Each inverter has an independent Tokio polling task with a default **60-second
-minimum interval**. `POLL_MODE=sequential` (the default) polls one inverter at a
-time. `POLL_MODE=concurrent` allows overlapping reads while a shared radio
-coordinator serializes discovery, connection attempts, and disconnects. A shared
+minimum interval**. `POLL_MODE=sequential` (the default) permits one complete
+Bluetooth attempt (discovery, connection, read, cleanup) at a time. The slot is
+released during retry backoff so another inverter can run without overlapping
+Bluetooth sessions. `POLL_MODE=concurrent` allows overlapping reads while a shared
 radio coordinator serializes discovery, connection attempts, and disconnects.
-Successfully connected peripherals are cached, so the next cycle skips the full
-scan when the inverter is still advertising from the previous read.
-Failed cached connections are logged and evicted from the cache, then receive
-bounded disconnect cleanup and a two-second radio cooldown before discovery and
-another connection attempt. Cleanup failures and timeouts are logged explicitly;
-recovery waits count against the polling budget.
 
-Each polling cycle allows up to **three attempts**, with randomized backoff of
-2–5 seconds before the second attempt and 4–7 seconds before the third. A shared
-90-second per-inverter budget (`POLL_TIMEOUT_SECONDS`) covers radio-coordinator
-waits, discovery, connection, reads, and retry backoff. Failed reads and
+Every connection uses discovery; peripheral handles are not cached across reads.
+The collector subscribes to adapter events, drains initial known-device events,
+then scans until it sees a target discovery/update or advertisement event, or
+the scan budget expires. An entry in BlueZ's known-peripheral list alone is not
+accepted as a fresh sighting. Disappearing peripherals are ignored during lookup.
+Discovery is stopped on success, error, and timeout. A fresh sighting improves
+connection selection but does not guarantee the inverter accepts a connection.
+Disconnect cleanup is bounded and followed by a two-second radio cooldown.
+
+Each polling cycle allows up to **five attempts**, with randomized backoff of
+2–5 seconds before the second attempt, 4–7 before the third, 6–9 before the fourth,
+and 8–11 before the fifth. A shared **45-second** per-inverter budget
+(`POLL_TIMEOUT_SECONDS`) covers polling-slot waits, radio-coordinator waits,
+discovery, connection, reads, and retry backoff. A new attempt requires at least
+ten seconds remaining, checked both before and after acquiring the polling slot;
+backoff is skipped if it would leave less than that headroom. This is a minimum
+useful-read allowance, not a guarantee of a complete read or five attempts.
+Bounded scan/disconnect cleanup can finish beyond the deadline. Failed reads and
 connection attempts are retried; partial failed reads are discarded rather than
 merged across attempts. The next cycle starts after the configured interval, or
 at least one second after an overlong cycle finishes. Cycles for the **same**
@@ -121,19 +130,29 @@ Bluetooth timing can be tuned with environment variables:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SCAN_DURATION_SECONDS` | `2` | Seconds to scan for inverter advertisements per connection attempt |
+| `POLL_TIMEOUT_SECONDS` | `45` | Shared cycle budget including slot waits and retries; bounded cleanup may finish afterward |
+| `SCAN_DURATION_SECONDS` | `5` | Maximum seconds to wait for a fresh target sighting; discovery ends early on a match |
 | `INTER_COMMAND_SLEEP_MS` | `100` | Milliseconds between each GATT command during a read |
-| `DISCONNECT_TIMEOUT_SECONDS` | `3` | Maximum seconds to wait for Bluetooth disconnect cleanup |
+| `DISCONNECT_TIMEOUT_SECONDS` | `5` | Maximum seconds to wait for Bluetooth disconnect cleanup |
 
-The previous defaults (5s scan, 500ms inter-command sleep, 5s disconnect) added
-about 23s of fixed overhead per read. Current defaults cut that to roughly 7–9s.
-If you see `No response to command` warnings, increase `INTER_COMMAND_SLEEP_MS`
-or `POLL_TIMEOUT_SECONDS`.
+Existing `/etc/solar-inverters.env` values override new defaults. When upgrading,
+set `POLL_TIMEOUT_SECONDS=45`, `SCAN_DURATION_SECONDS=5`, and
+`DISCONNECT_TIMEOUT_SECONDS=5` there; the service does not rewrite that file.
+Keep `INTER_COMMAND_SLEEP_MS=100` initially. If you see `No response to command`
+warnings, consider increasing command spacing, using cycle diagnostics to check
+that the read still fits within the polling budget.
 
 Logs include the inverter serial, attempt number, complete error chain, and a
 per-inverter status summary (`cycles`, `successes`, `seconds_since_success`).
 `seconds_since_success=None` means no reading has succeeded since this process
 started. Counts describe whole polling cycles, not individual connection attempts.
+Status logs also include whole-cycle `cycle_ms` (including retries, backoff,
+slot waits, cleanup, and spool enqueue), `attempts_used`, cumulative
+`slot_wait_ms`, and `stop_reason`: `success`, `attempt_limit`, `deadline`, or
+`insufficient_budget`. The last reason means there was too little headroom to
+start another useful attempt. Discovery logs include `target_observed` and
+`scan_ms`; connection, discovery, and measurement failures have distinct error
+contexts. Startup logs show the effective timing settings.
 
 Each queued-measurement log includes:
 - **`complete=true`**: every requested command received a response.
@@ -146,9 +165,10 @@ Debug logging adds discovery, connection, read, and disconnect stages. Field
 values in logs are rounded to three decimal places; stored precision is unchanged.
 `command_ms` measures the full command loop once, including writes, response
 waits, and inter-command sleeps. `sleep_ms` and `response_wait_ms` are components
-of that duration, not additional phases to add to it. `connection_ms` includes
-both cached and post-discovery connection attempts within the successful read
-attempt; `total_ms` excludes earlier failed read attempts and retry backoff.
+of that duration, not additional phases to add to it. `connection_ms` measures
+the connection within the successful read attempt; `total_ms` excludes earlier
+failed attempts, polling-slot waits, and retry backoff. Use `cycle_ms` for the
+whole polling cycle.
 
 Every completed read is written to the spool before upload. Failed HTTP writes
 retain the original line and timestamp for retry; resending a point is

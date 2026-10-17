@@ -2,10 +2,10 @@ mod protocol;
 
 use anyhow::{bail, Context, Result};
 use btleplug::{
-    api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType},
+    api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, WriteType},
     platform::{Adapter, Manager, Peripheral},
 };
-use futures::StreamExt;
+use futures::{FutureExt, Stream, StreamExt};
 use std::{
     collections::BTreeMap,
     env,
@@ -23,6 +23,16 @@ use uuid::Uuid;
 
 const WRITE: Uuid = Uuid::from_u128(0xee6d717188c611e8b444060400ef5315);
 const NOTIFY: Uuid = Uuid::from_u128(0xee6d717288c611e8b444060400ef5315);
+const MAX_ATTEMPTS: u32 = 5;
+// Avoid spending the end of a cycle on a connection with little time left to read.
+const MIN_ATTEMPT_BUDGET: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct RetryStats {
+    attempts_used: u32,
+    slot_wait_ms: u64,
+    stop_reason: &'static str,
+}
 
 // Per-read quality metrics, logged alongside every polling cycle so partial
 // reads are visible even when they still produce usable data.
@@ -101,10 +111,10 @@ impl Config {
             });
         }
         let interval: u64 = setting("POLL_INTERVAL_SECONDS", "60").parse()?;
-        let poll_timeout: u64 = setting("POLL_TIMEOUT_SECONDS", "90").parse()?;
-        let scan_duration: u64 = setting("SCAN_DURATION_SECONDS", "2").parse()?;
+        let poll_timeout: u64 = setting("POLL_TIMEOUT_SECONDS", "45").parse()?;
+        let scan_duration: u64 = setting("SCAN_DURATION_SECONDS", "5").parse()?;
         let inter_command_sleep: u64 = setting("INTER_COMMAND_SLEEP_MS", "100").parse()?;
-        let disconnect_timeout: u64 = setting("DISCONNECT_TIMEOUT_SECONDS", "3").parse()?;
+        let disconnect_timeout: u64 = setting("DISCONNECT_TIMEOUT_SECONDS", "5").parse()?;
         if interval == 0 || poll_timeout == 0 {
             bail!("Polling durations must be positive");
         }
@@ -334,12 +344,37 @@ async fn flush(client: &reqwest::Client, config: &Config) -> Result<()> {
     Ok(())
 }
 
+// BlueZ's events() starts with synthetic events for already-known peripherals.
+// Drain those before starting discovery; they are not evidence of a fresh sighting.
+fn discard_ready_events<S: Stream + Unpin>(events: &mut S) -> Result<()> {
+    loop {
+        match events.next().now_or_never() {
+            Some(Some(_)) => {}
+            Some(None) => bail!("Bluetooth discovery event stream ended"),
+            None => return Ok(()),
+        }
+    }
+}
+
+async fn wait_for_target<S, T>(events: &mut S, target: &str) -> Result<T>
+where
+    S: Stream<Item = Option<(String, T)>> + Unpin,
+{
+    while let Some(event) = events.next().await {
+        if let Some((address, device)) = event {
+            if address == target {
+                return Ok(device);
+            }
+        }
+    }
+    bail!("Bluetooth discovery event stream ended before target was observed")
+}
+
 // One coordinator owns adapter-wide discovery and connection establishment.
 // The guard is released during GATT reads, allowing readings to overlap.
 struct Radio {
     adapter: Adapter,
     ready_at: Mutex<Instant>,
-    cache: Mutex<BTreeMap<String, Peripheral>>,
 }
 
 impl Radio {
@@ -357,70 +392,63 @@ impl Radio {
             .await
             .context("Radio cooldown exceeded polling budget")?;
 
-        // Try the cached peripheral first—avoids a full scan cycle when the
-        // inverter is still advertising from the previous read.
-        let cached = self.cache.lock().await.get(&inverter.mac).cloned();
-        if let Some(cached) = cached {
-            let connect_start = Instant::now();
-            let connected = timeout_at(
-                deadline.min(Instant::now() + Duration::from_secs(10)),
-                cached.connect(),
-            )
-            .await;
-            timing.connect_attempt_ms = connect_start.elapsed().as_millis() as u64;
-            match connected {
-                Ok(Ok(())) => {
-                    info!(
-                        connection_ms = timing.connect_attempt_ms,
-                        "Bluetooth connected (cached)"
-                    );
-                    return Ok(cached);
-                }
-                result => {
-                    let error = match result {
-                        Ok(Err(error)) => format!("{error:#}"),
-                        Err(error) => format!("Cached Bluetooth connection timed out: {error}"),
-                        _ => unreachable!(),
-                    };
-                    warn!(
-                        connection_ms = timing.connect_attempt_ms,
-                        %error,
-                        "Cached Bluetooth connection failed; cleaning up before discovery"
-                    );
-                    self.cache.lock().await.remove(&inverter.mac);
-                    let disconnected = disconnect(&cached, config.disconnect_timeout_seconds).await;
-                    info!(disconnected, "Cached connection cleanup finished");
-                    *ready_at = Instant::now() + Duration::from_secs(2);
-                    timeout_at(deadline, sleep_until(*ready_at))
-                        .await
-                        .context("Cached connection recovery exceeded polling budget")?;
-                }
-            }
-        }
-
         debug!(stage = "discovery", "Refreshing Bluetooth discovery");
         let scan_start = Instant::now();
         let discovered = timeout_at(
-            deadline.min(Instant::now() + Duration::from_secs(10)),
+            deadline.min(Instant::now() + Duration::from_secs(config.scan_duration_seconds)),
             async {
-                self.adapter.start_scan(ScanFilter::default()).await?;
-                sleep(Duration::from_secs(config.scan_duration_seconds)).await;
-                self.adapter.peripherals().await
+                let mut events = self
+                    .adapter
+                    .events()
+                    .await
+                    .context("Subscribe to discovery events")?;
+                discard_ready_events(&mut events)?;
+                self.adapter
+                    .start_scan(ScanFilter::default())
+                    .await
+                    .context("Start discovery")?;
+                let sightings = events.then(|event| async {
+                    let id = match event {
+                        CentralEvent::DeviceDiscovered(id)
+                        | CentralEvent::DeviceUpdated(id)
+                        | CentralEvent::ManufacturerDataAdvertisement { id, .. }
+                        | CentralEvent::ServiceDataAdvertisement { id, .. }
+                        | CentralEvent::ServicesAdvertisement { id, .. } => id,
+                        _ => return None,
+                    };
+                    match self.adapter.peripheral(&id).await {
+                        Ok(device) => Some((device.address().to_string(), device)),
+                        Err(error) => {
+                            debug!(%error, "Discovery peripheral disappeared before lookup");
+                            None
+                        }
+                    }
+                });
+                futures::pin_mut!(sightings);
+                wait_for_target(&mut sightings, &inverter.mac).await
             },
         )
         .await;
-        // Always stop discovery, including when its start or enumeration timed out.
+        // Always stop discovery, including when subscription/start/sighting timed out.
         // Keep the coordinator locked until cleanup completes.
         timeout(Duration::from_secs(3), self.adapter.stop_scan())
             .await
             .context("Stop discovery timed out")?
             .context("Stop discovery failed")?;
         timing.scan_ms = scan_start.elapsed().as_millis() as u64;
+        let target_observed = matches!(&discovered, Ok(Ok(_)));
+        info!(
+            stage = "discovery",
+            target_observed,
+            scan_ms = timing.scan_ms,
+            "Bluetooth discovery finished"
+        );
         let device = discovered
-            .context("Discovery timed out")??
-            .into_iter()
-            .find(|p| p.address().to_string() == inverter.mac)
-            .context("Inverter not discovered")?;
+            .context("Discovery timed out waiting for a fresh target sighting")?
+            .context("Discover target inverter")?;
+        if Instant::now() >= deadline {
+            bail!("Polling budget expired after discovery cleanup");
+        }
         debug!(stage = "connect", "Establishing Bluetooth connection");
         let connect_start = Instant::now();
         let connected = timeout_at(
@@ -428,27 +456,24 @@ impl Radio {
             device.connect(),
         )
         .await;
-        timing.connect_attempt_ms += connect_start.elapsed().as_millis() as u64;
+        timing.connect_attempt_ms = connect_start.elapsed().as_millis() as u64;
         match connected {
-            Ok(Ok(())) => {
-                info!(
-                    connection_ms = timing.connect_attempt_ms,
-                    "Bluetooth connected"
-                );
-                self.cache
-                    .lock()
-                    .await
-                    .insert(inverter.mac.clone(), device.clone());
-                Ok(device)
-            }
+            Ok(Ok(())) => Ok(device),
             result => {
+                let error = match result {
+                    Ok(Err(error)) => {
+                        anyhow::Error::new(error).context("Bluetooth connection failed")
+                    }
+                    Err(error) => {
+                        anyhow::Error::new(error).context("Bluetooth connection timed out")
+                    }
+                    _ => unreachable!(),
+                };
+                warn!(stage = "connect", connection_ms = timing.connect_attempt_ms,
+                    error = %format!("{error:#}"), "Bluetooth connection attempt failed");
                 disconnect(&device, config.disconnect_timeout_seconds).await;
                 *ready_at = Instant::now() + Duration::from_secs(2);
-                match result {
-                    Ok(Err(error)) => Err(error).context("Bluetooth connection failed"),
-                    Err(error) => Err(error).context("Bluetooth connection timed out"),
-                    _ => unreachable!(),
-                }
+                Err(error)
             }
         }
     }
@@ -484,7 +509,7 @@ impl Radio {
         debug!(disconnected, disconnect_ms, "Bluetooth cleanup finished");
         *ready_at = Instant::now() + Duration::from_secs(2);
 
-        let (fields, quality) = result??;
+        let (fields, quality) = result?.context("Collect measurements")?;
         timing.disconnect_ms = disconnect_ms;
         timing.total_ms = cycle_start.elapsed().as_millis() as u64;
         Ok((fields, quality, timing))
@@ -514,29 +539,78 @@ fn retry_delay(attempt: u32) -> Duration {
 
 // The operation must bound its own I/O by deadline, then finish cleanup. Do not
 // cancel the entire operation here: that could leave a scan/connection active.
-async fn retry_read<T, F, Fut>(deadline: Instant, mut operation: F) -> Result<T>
+async fn retry_read<T, F, Fut>(
+    deadline: Instant,
+    slots: &Semaphore,
+    stats: &mut RetryStats,
+    mut operation: F,
+) -> Result<T>
 where
     F: FnMut(Instant) -> Fut,
     Fut: Future<Output = Result<T>>,
 {
     let mut last_error = anyhow::anyhow!("Polling budget expired");
-    for attempt in 1..=3 {
+    for attempt in 1..=MAX_ATTEMPTS {
         if Instant::now() >= deadline {
+            stats.stop_reason = "deadline";
             break;
         }
-        info!(attempt, "Starting read attempt");
-        match operation(deadline).await {
-            Ok(value) => return Ok(value),
+        if deadline.saturating_duration_since(Instant::now()) < MIN_ATTEMPT_BUDGET {
+            stats.stop_reason = "insufficient_budget";
+            break;
+        }
+        let wait_started = Instant::now();
+        let slot = timeout_at(deadline, slots.acquire()).await;
+        stats.slot_wait_ms += wait_started.elapsed().as_millis() as u64;
+        let slot = match slot {
+            Ok(slot) => slot.context("Polling semaphore closed")?,
+            Err(error) => {
+                stats.stop_reason = "deadline";
+                return Err(error).context("Polling budget expired waiting for polling slot");
+            }
+        };
+        // Slot contention counts against the same deadline as I/O and backoff.
+        if deadline.saturating_duration_since(Instant::now()) < MIN_ATTEMPT_BUDGET {
+            stats.stop_reason = if Instant::now() >= deadline {
+                "deadline"
+            } else {
+                "insufficient_budget"
+            };
+            break;
+        }
+        stats.attempts_used += 1;
+        info!(
+            attempt,
+            budget_remaining_ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis(),
+            "Starting read attempt"
+        );
+        let result = operation(deadline).await;
+        // Keep the complete Bluetooth session sequential, but let another inverter
+        // use the slot while this one backs off. Cleanup finishes inside operation.
+        drop(slot);
+        match result {
+            Ok(value) => {
+                stats.stop_reason = "success";
+                return Ok(value);
+            }
             Err(error) => {
                 warn!(attempt, error = %format!("{error:#}"), "Read attempt failed");
                 last_error = error;
             }
         }
-        if attempt == 3 {
+        if Instant::now() >= deadline {
+            stats.stop_reason = "deadline";
+            break;
+        }
+        if attempt == MAX_ATTEMPTS {
+            stats.stop_reason = "attempt_limit";
             break;
         }
         let delay = retry_delay(attempt);
-        if Instant::now() + delay >= deadline {
+        if Instant::now() + delay + MIN_ATTEMPT_BUDGET > deadline {
+            stats.stop_reason = "insufficient_budget";
             break;
         }
         info!(delay_ms = delay.as_millis(), "Backing off before retry");
@@ -556,17 +630,18 @@ async fn poll_inverter(
     let mut cycles = 0u64;
     let mut successes = 0u64;
     loop {
-        // Sequential mode holds the slot for a complete read/retry cycle;
-        // concurrent mode permits one independent worker per inverter.
-        let slot = slots.acquire().await?;
         let started = Instant::now();
         // Label the cycle consistently even when a retry connects in a later minute.
         let timestamp = chrono::Utc::now()
             .timestamp_nanos_opt()
             .expect("UTC timestamp fits i64");
-        let result = retry_read(started + config.poll_timeout, |deadline| {
-            radio.read(config, inverter, deadline)
-        })
+        let mut retry_stats = RetryStats::default();
+        let result = retry_read(
+            started + config.poll_timeout,
+            slots,
+            &mut retry_stats,
+            |deadline| radio.read(config, inverter, deadline),
+        )
         .await;
         cycles += 1;
         match result {
@@ -611,8 +686,10 @@ async fn poll_inverter(
             }
             Err(error) => warn!(error = %format!("{error:#}"), "Polling cycle failed"),
         }
-        info!(cycles, successes, seconds_since_success = ?last_success.map(|time| time.elapsed().as_secs()), "Inverter polling status");
-        drop(slot);
+        info!(cycles, successes, seconds_since_success = ?last_success.map(|time| time.elapsed().as_secs()),
+            cycle_ms = started.elapsed().as_millis(), attempts_used = retry_stats.attempts_used,
+            slot_wait_ms = retry_stats.slot_wait_ms, stop_reason = retry_stats.stop_reason,
+            "Inverter polling status");
         sleep(
             config
                 .interval
@@ -647,11 +724,13 @@ async fn run(config: Config) -> Result<()> {
     let adapter = adapters
         .get(config.adapter)
         .context("Bluetooth adapter not found; check host BlueZ and adapter index")?;
-    info!(adapter = %adapter.adapter_info().await?, concurrent = config.concurrent, "Starting collector");
+    info!(adapter = %adapter.adapter_info().await?, concurrent = config.concurrent,
+        poll_timeout_seconds = config.poll_timeout.as_secs(), max_attempts = MAX_ATTEMPTS,
+        scan_duration_seconds = config.scan_duration_seconds,
+        disconnect_timeout_seconds = config.disconnect_timeout_seconds, "Starting collector");
     let radio = Radio {
         adapter: adapter.clone(),
         ready_at: Mutex::new(Instant::now()),
-        cache: Mutex::new(BTreeMap::new()),
     };
     let slots = Semaphore::new(if config.concurrent {
         config.inverters.len()
@@ -699,42 +778,204 @@ mod tests {
     async fn retrying_inverter_does_not_block_healthy_one() {
         let failures = AtomicUsize::new(0);
         let healthy = AtomicUsize::new(0);
-        let deadline = Instant::now() + Duration::from_secs(90);
-        let retrying = retry_read(deadline, |_| async {
+        let active = AtomicUsize::new(0);
+        let slots = Semaphore::new(1);
+        let mut retrying_stats = RetryStats::default();
+        let mut healthy_stats = RetryStats::default();
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let retrying = retry_read(deadline, &slots, &mut retrying_stats, |_| async {
+            assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
             let attempt = failures.fetch_add(1, Ordering::SeqCst);
+            sleep(Duration::from_secs(1)).await;
+            assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
             if attempt < 2 {
                 bail!("Simulated connection contention");
             }
             assert_eq!(healthy.load(Ordering::SeqCst), 1);
             Ok("example-a")
         });
-        let working = retry_read(deadline, |_| async {
+        let working = retry_read(deadline, &slots, &mut healthy_stats, |_| async {
+            assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+            // This inverter must run after the first failure, during its backoff.
+            assert_eq!(failures.load(Ordering::SeqCst), 1);
+            sleep(Duration::from_secs(1)).await;
             healthy.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
             Ok("example-b")
         });
         let (retrying, working) = tokio::join!(retrying, working);
         assert_eq!(retrying.unwrap(), "example-a");
         assert_eq!(working.unwrap(), "example-b");
         assert_eq!(failures.load(Ordering::SeqCst), 3);
+        assert_eq!(retrying_stats.stop_reason, "success");
+        assert_eq!(healthy_stats.slot_wait_ms, 1000);
+        assert_eq!(slots.available_permits(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn retries_stop_at_attempt_limit_or_budget() {
         for budget in [1, 90] {
             let attempts = AtomicUsize::new(0);
+            let slots = Semaphore::new(1);
+            let mut stats = RetryStats::default();
             let started = Instant::now();
-            let result: Result<()> = retry_read(started + Duration::from_secs(budget), |_| async {
-                attempts.fetch_add(1, Ordering::SeqCst);
-                bail!("Unavailable");
-            })
+            let result: Result<()> = retry_read(
+                started + Duration::from_secs(budget),
+                &slots,
+                &mut stats,
+                |_| async {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    bail!("Unavailable");
+                },
+            )
             .await;
             assert!(result.is_err());
             assert_eq!(
                 attempts.load(Ordering::SeqCst),
-                if budget == 1 { 1 } else { 3 }
+                if budget == 1 {
+                    0
+                } else {
+                    MAX_ATTEMPTS as usize
+                }
             );
             assert!(started.elapsed() < Duration::from_secs(budget));
+            assert_eq!(
+                stats.stop_reason,
+                if budget == 1 {
+                    "insufficient_budget"
+                } else {
+                    "attempt_limit"
+                }
+            );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slot_wait_uses_budget_and_does_not_start_a_late_attempt() {
+        for release_after in [15, 25] {
+            let slots = Semaphore::new(1);
+            let held = slots.acquire().await.unwrap();
+            let mut stats = RetryStats::default();
+            let started = Instant::now();
+            let waiting = async {
+                let result: Result<()> = retry_read(
+                    started + Duration::from_secs(20),
+                    &slots,
+                    &mut stats,
+                    |_| async { panic!("No useful read budget remains after waiting") },
+                )
+                .await;
+                assert!(result.is_err());
+                assert_eq!(
+                    started.elapsed(),
+                    Duration::from_secs(release_after.min(20))
+                );
+            };
+            let releasing = async {
+                sleep(Duration::from_secs(release_after)).await;
+                drop(held);
+            };
+            tokio::join!(waiting, releasing);
+            assert_eq!(stats.attempts_used, 0);
+            assert_eq!(stats.slot_wait_ms, release_after.min(20) * 1000);
+            assert_eq!(
+                stats.stop_reason,
+                if release_after < 20 {
+                    "insufficient_budget"
+                } else {
+                    "deadline"
+                }
+            );
+            assert_eq!(slots.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_budget_is_not_reset_after_a_failed_attempt() {
+        let slots = Semaphore::new(1);
+        let mut stats = RetryStats::default();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(45);
+        let result: Result<()> = retry_read(
+            deadline,
+            &slots,
+            &mut stats,
+            |attempt_deadline| async move {
+                assert_eq!(attempt_deadline, deadline);
+                sleep_until(attempt_deadline).await;
+                // Operations finish bounded cleanup before releasing the slot.
+                sleep(Duration::from_secs(2)).await;
+                bail!("Read timed out, cleanup finished");
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(stats.attempts_used, 1);
+        assert_eq!(stats.stop_reason, "deadline");
+        assert_eq!(started.elapsed(), Duration::from_secs(47));
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_is_skipped_when_it_would_leave_too_little_read_time() {
+        let slots = Semaphore::new(1);
+        let mut stats = RetryStats::default();
+        let started = Instant::now();
+        let result: Result<()> = retry_read(
+            started + Duration::from_secs(20),
+            &slots,
+            &mut stats,
+            |_| async {
+                sleep(Duration::from_secs(9)).await;
+                bail!("Failed with eleven seconds remaining");
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        // Even the shortest backoff (2 s) would leave less than the 10 s minimum.
+        assert_eq!(started.elapsed(), Duration::from_secs(9));
+        assert_eq!(stats.attempts_used, 1);
+        assert_eq!(stats.stop_reason, "insufficient_budget");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_ignores_initial_devices_and_waits_for_fresh_target() -> Result<()> {
+        let (sender, mut sightings) = futures::channel::mpsc::unbounded();
+        // BlueZ reports known peripherals immediately when events() is opened.
+        sender.unbounded_send(Some(("target".into(), "stale handle")))?;
+        discard_ready_events(&mut sightings)?;
+        let advertising = async {
+            sleep(Duration::from_secs(1)).await;
+            sender.unbounded_send(None).unwrap();
+            sender
+                .unbounded_send(Some(("other".into(), "wrong device")))
+                .unwrap();
+            sleep(Duration::from_secs(1)).await;
+            sender
+                .unbounded_send(Some(("target".into(), "fresh handle")))
+                .unwrap();
+        };
+        let (device, ()) = tokio::join!(wait_for_target(&mut sightings, "target"), advertising);
+        assert_eq!(device?, "fresh handle");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_times_out_without_target_and_reports_closed_stream() -> Result<()> {
+        let (sender, mut sightings) = futures::channel::mpsc::unbounded();
+        sender.unbounded_send(Some(("other".into(), "wrong device")))?;
+        let started = Instant::now();
+        let result = timeout(
+            Duration::from_secs(5),
+            wait_for_target(&mut sightings, "target"),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        drop(sender);
+        assert!(wait_for_target(&mut sightings, "target").await.is_err());
+        assert!(discard_ready_events(&mut sightings).is_err());
+        Ok(())
     }
 
     #[tokio::test]
@@ -802,12 +1043,12 @@ mod tests {
             database: "solar".into(),
             spool: spool.clone(),
             interval: Duration::from_secs(60),
-            poll_timeout: Duration::from_secs(90),
+            poll_timeout: Duration::from_secs(45),
             adapter: 0,
             concurrent: true,
-            scan_duration_seconds: 2,
+            scan_duration_seconds: 5,
             inter_command_sleep_ms: 100,
-            disconnect_timeout_seconds: 3,
+            disconnect_timeout_seconds: 5,
         };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
