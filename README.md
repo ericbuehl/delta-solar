@@ -150,8 +150,12 @@ Status logs also include whole-cycle `cycle_ms` (including retries, backoff,
 slot waits, cleanup, and spool enqueue), `attempts_used`, cumulative
 `slot_wait_ms`, and `stop_reason`: `success`, `attempt_limit`, `deadline`, or
 `insufficient_budget`. The last reason means there was too little headroom to
-start another useful attempt. Discovery logs include `target_observed` and
-`scan_ms`; connection, discovery, and measurement failures have distinct error
+start another useful attempt. Discovery logs include `target_observed`,
+`scan_ms`, and the target's reported `rssi_dbm` (for example, `Some(-83)`).
+Connection-failure logs repeat the RSSI observed at discovery, not a new reading
+at the time of failure. RSSI is diagnostic only: unavailable values are `None`,
+and the best-effort property lookup is capped at 250 ms within the polling
+deadline. Connection, discovery, and measurement failures have distinct error
 contexts. Startup logs show the effective timing settings.
 
 Each queued-measurement log includes:

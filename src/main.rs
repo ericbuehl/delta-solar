@@ -437,10 +437,32 @@ impl Radio {
             .context("Stop discovery failed")?;
         timing.scan_ms = scan_start.elapsed().as_millis() as u64;
         let target_observed = matches!(&discovered, Ok(Ok(_)));
+        // RSSI is diagnostic only. Missing properties must not fail discovery,
+        // and the lookup shares the polling deadline with a short local cap.
+        let rssi_dbm = match &discovered {
+            Ok(Ok(device)) => match timeout_at(
+                deadline.min(Instant::now() + Duration::from_millis(250)),
+                device.properties(),
+            )
+            .await
+            {
+                Ok(Ok(properties)) => properties.and_then(|properties| properties.rssi),
+                Ok(Err(error)) => {
+                    debug!(%error, "Target RSSI unavailable");
+                    None
+                }
+                Err(_) => {
+                    debug!("Target RSSI lookup timed out");
+                    None
+                }
+            },
+            _ => None,
+        };
         info!(
             stage = "discovery",
             target_observed,
             scan_ms = timing.scan_ms,
+            rssi_dbm = ?rssi_dbm,
             "Bluetooth discovery finished"
         );
         let device = discovered
@@ -469,7 +491,7 @@ impl Radio {
                     }
                     _ => unreachable!(),
                 };
-                warn!(stage = "connect", connection_ms = timing.connect_attempt_ms,
+                warn!(stage = "connect", connection_ms = timing.connect_attempt_ms, rssi_dbm = ?rssi_dbm,
                     error = %format!("{error:#}"), "Bluetooth connection attempt failed");
                 disconnect(&device, config.disconnect_timeout_seconds).await;
                 *ready_at = Instant::now() + Duration::from_secs(2);
